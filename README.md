@@ -145,7 +145,7 @@ no private resolver address appears:
 ```
 $ dns-check -resolvers 1.1.1.1,8.8.8.8,9.9.9.9 example.com
 DNS and email check for example.com
-Checked 2026-11-13 18:59 UTC with 3 resolvers: Cloudflare (1.1.1.1), Google
+Checked 2026-11-13 19:25 UTC with 3 resolvers: Cloudflare (1.1.1.1), Google
 (8.8.8.8) and Quad9 (9.9.9.9).
 Summary: 0 problems, 0 warnings, 4 notes, 8 things look good.
 
