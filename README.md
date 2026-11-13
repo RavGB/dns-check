@@ -138,62 +138,67 @@ Flags:
 
 ## Sample output
 
-This is a real run against ravgb.com on 2026-11-13, copied as printed. It asks
-only the three public resolvers, so no private resolver address appears:
+This is a real run against example.com, the domain reserved for documentation,
+on 2026-11-13, copied as printed. It asks only the three public resolvers, so
+no private resolver address appears:
 
 ```
-$ dns-check -resolvers 1.1.1.1,8.8.8.8,9.9.9.9 ravgb.com
-DNS and email check for ravgb.com
-Checked 2026-11-13 18:48 UTC with 3 resolvers: Cloudflare (1.1.1.1), Google
+$ dns-check -resolvers 1.1.1.1,8.8.8.8,9.9.9.9 example.com
+DNS and email check for example.com
+Checked 2026-11-13 18:59 UTC with 3 resolvers: Cloudflare (1.1.1.1), Google
 (8.8.8.8) and Quad9 (9.9.9.9).
-Summary: 0 problems, 1 warning, 5 notes, 7 things look good.
+Summary: 0 problems, 0 warnings, 4 notes, 8 things look good.
 
 Website
-  [ok]      ravgb.com points to 104.21.16.6 and 172.67.165.163, and to
-            2606:4700:3030::ac43:a5a3 and 2606:4700:3033::6815:1006 over IPv6.
-  [ok]      www.ravgb.com works. It points to 104.21.16.6 and 172.67.165.163.
+  [ok]      example.com points to 104.20.23.154 and 172.66.147.243, and to
+            2606:4700:10::6814:179a and 2606:4700:10::ac42:93f3 over IPv6.
+  [ok]      www.example.com works. It points to 104.20.23.154 and
+            172.66.147.243.
 
 Name servers
-  [ok]      2 name servers: isaac.ns.cloudflare.com and vida.ns.cloudflare.com
+  [ok]      2 name servers: elliott.ns.cloudflare.com and hera.ns.cloudflare.com
             (looks like Cloudflare).
 
 Email delivery
-  [ok]      Email for ravgb.com is delivered to sunfire.mxrouting.net and
-            sunfire-relay.mxrouting.net.
+  [ok]      example.com says it does not accept email (a null MX record). That
+            is right if the domain never receives email.
 
 Email security
-  [warning] DMARC is set to p=none, which is monitoring only. Receivers may
-            report fakes to you, but they are still told to deliver them.
   [ok]      SPF is set up and ends in -all, so email from servers not on the
-            list should be rejected. It uses 4 of the 10 allowed DNS lookups.
-            Record: v=spf1 include:mxroute.com -all
+            list should be rejected. It uses 0 of the 10 allowed DNS lookups.
+            Record: v=spf1 -all
+  [ok]      DMARC is set to p=reject, so email that fails the checks should be
+            refused.
   [note]    DMARC has no reporting address (rua=), so nobody receives the
             reports about who sends email using this domain.
-  [ok]      A DKIM signing key was found at selector resend.
-  [note]    No MTA-STS record. MTA-STS asks other mail servers to always use an
-            encrypted connection when they deliver email to you.
-  [note]    No TLS reporting record (TLS-RPT), so nobody is told when other
-            servers fail to deliver email to you over an encrypted connection.
+  [note]    All 14 DKIM selector names checked return an empty key. That is how
+            a domain says it does not sign email, which is normal if it sends no
+            email.
+  [note]    No BIMI record. With DMARC already enforcing, BIMI lets some inboxes
+            show your logo next to your email.
 
 Domain security
   [note]    No CAA record, so any certificate authority may issue a certificate
-            for ravgb.com.
-  [note]    DNSSEC is off. DNSSEC lets resolvers detect forged DNS answers for
-            this domain.
+            for example.com.
+  [ok]      DNSSEC is on (a DS record is published at the registry), so
+            resolvers can detect forged DNS answers for this domain.
 
 Resolvers
   [ok]      All 3 resolvers gave the same answers.
 
-Could someone send email that looks like it comes from ravgb.com?
-  Yes: DMARC is set to monitoring only (p=none), so nothing tells receiving mail
-  servers to block a fake that shows ravgb.com in the From line people see. SPF
-  is set up, but on its own it only stops fakes that also forge the hidden
-  sender address, which a faker does not need to do.
+Could someone send email that looks like it comes from example.com?
+  Unlikely: DMARC is set to reject, so receiving mail servers are told to refuse
+  email that fails the SPF and DKIM checks.
 
 Top fixes
-  1. Add rua=mailto:<a mailbox you read> to the DMARC record so you get reports,
-     then, once they show all your real email passes, change p=none to
-     p=quarantine and then p=reject.
+  Nothing urgent.
+  Optional improvements:
+  1. Add rua=mailto:<a mailbox you read> to the DMARC record to get daily
+     reports about who sends email using your domain.
+  2. Add a CAA record naming the certificate authority you use, for example 0
+     issue "letsencrypt.org" if your certificates come from Let's Encrypt.
+  3. Publish a BIMI record at default._bimi.example.com pointing to your logo in
+     SVG format.
 
 dns-check 0.1.0 by RavGB, https://ravgb.com
 ```

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const wrapWidth = 80
@@ -97,7 +98,7 @@ func writeText(w io.Writer, rep *Report, verbose bool) {
 			p("  Optional improvements:\n")
 			for i, f := range rep.OptionalFixes {
 				num := fmt.Sprintf("  %d. ", i+1)
-				p("%s", wrap(strings.TrimPrefix(printable(f), "Optional: "), num, strings.Repeat(" ", len(num))))
+				p("%s", wrap(upperFirst(strings.TrimPrefix(printable(f), "Optional: ")), num, strings.Repeat(" ", len(num))))
 			}
 		}
 	}
@@ -189,4 +190,14 @@ func printable(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// upperFirst capitalises the first letter, so an optional fix reads as a
+// sentence once its "Optional: " prefix is removed.
+func upperFirst(s string) string {
+	r, size := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError {
+		return s
+	}
+	return string(unicode.ToUpper(r)) + s[size:]
 }

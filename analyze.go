@@ -981,20 +981,33 @@ func (a *analyzer) dkim() {
 	if tried == 0 {
 		return
 	}
-	if len(found) > 0 {
+	switch {
+	case len(found) > 0:
 		msg := fmt.Sprintf("A DKIM signing key was found at selector %s.", found[0])
 		if len(found) > 1 {
 			msg = fmt.Sprintf("DKIM signing keys were found at selectors %s.", joinAnd(found))
 		}
 		a.add(SevOK, areaMailSec, "dkim_found", msg, "")
-	} else {
+	case len(revoked) == tried:
+		// Every selector answers with an empty key. That is a domain-wide
+		// "no DKIM keys here" (usually a wildcard), the normal setup for a
+		// domain that sends no email, so there is nothing to fix.
+		a.add(SevNote, areaMailSec, "dkim_all_revoked",
+			fmt.Sprintf("All %d DKIM selector names checked return an empty key. That is how a domain says it does not sign email, which is normal if it sends no email.", tried), "")
+		return
+	default:
 		a.add(SevNote, areaMailSec, "dkim_none_found",
 			fmt.Sprintf("No DKIM key was found at the %d common selector names checked. DKIM may still be set up under a name this check did not try.", tried),
 			"Turn on DKIM signing in your email provider (and in any service that sends email for you) and publish the record it gives you. If DKIM is already on, run this check again with -selectors and your selector name.")
 	}
-	if len(revoked) > 0 {
+	switch len(revoked) {
+	case 0:
+	case 1:
 		a.add(SevNote, areaMailSec, "dkim_revoked",
-			fmt.Sprintf("DKIM selector %s has an empty key, which means that key was withdrawn.", joinAnd(revoked)), "")
+			fmt.Sprintf("DKIM selector %s has an empty key, which means that key was withdrawn.", revoked[0]), "")
+	default:
+		a.add(SevNote, areaMailSec, "dkim_revoked",
+			fmt.Sprintf("DKIM selectors %s have empty keys, which means those keys were withdrawn.", joinAnd(revoked)), "")
 	}
 }
 
