@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -22,6 +24,10 @@ func checkDomain(ctx context.Context, c *Client, resolvers []Resolver, domain st
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("stopped before the check finished")
 	}
+	var notSeenBy []string
+	for _, ri := range dropUnseen(results) {
+		notSeenBy = append(notSeenBy, resolvers[ri].Name)
+	}
 	statuses, usable := resolverStatuses(resolvers, results)
 	if len(usable) == 0 {
 		var why []string
@@ -36,6 +42,7 @@ func checkDomain(ctx context.Context, c *Client, resolvers []Resolver, domain st
 		Resolvers:     statuses,
 		Records:       buildRecords(resolvers, results),
 		DKIMSelectors: []string{},
+		NotSeenBy:     notSeenBy,
 	}
 
 	var exp *spfExpansion
@@ -51,4 +58,41 @@ func checkDomain(ctx context.Context, c *Client, resolvers []Resolver, domain st
 	}
 	analyze(rep, exp)
 	return rep, nil
+}
+
+// errNotSeen replaces the answers of a resolver that says the domain does not
+// exist while another resolver sees it.
+var errNotSeen = errors.New("it does not see this domain yet (it says the domain does not exist)")
+
+// dropUnseen finds resolvers that answered "no such domain" (NXDOMAIN) for the
+// domain while at least one other resolver sees it. That usually means a new
+// or moved domain has not reached every resolver yet. Their answers are all
+// empty, so they are replaced with errNotSeen and the report is built from
+// the resolvers that see the domain. It returns the indexes of those
+// resolvers.
+func dropUnseen(results []QueryResult) []int {
+	i := slices.IndexFunc(results, func(qr QueryResult) bool { return qr.ID == "soa" })
+	if i < 0 {
+		return nil
+	}
+	var nx []int
+	seen := false
+	for ri, l := range results[i].Lookups {
+		switch {
+		case l.Err != nil:
+		case l.NXDomain:
+			nx = append(nx, ri)
+		default:
+			seen = true
+		}
+	}
+	if !seen || len(nx) == 0 {
+		return nil
+	}
+	for qi := range results {
+		for _, ri := range nx {
+			results[qi].Lookups[ri] = Lookup{Err: errNotSeen}
+		}
+	}
+	return nx
 }

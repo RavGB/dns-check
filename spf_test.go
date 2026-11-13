@@ -15,23 +15,34 @@ func TestParseSPF(t *testing.T) {
 		includes []string
 		unknown  int
 		ptr      bool
+		after    []string
 	}{
-		{"v=spf1 -all", "-", 0, nil, 0, false},
-		{"v=spf1 include:_spf.google.com ~all", "~", 1, []string{"_spf.google.com"}, 0, false},
-		{"v=spf1 a mx ptr exists:%{i}.x.test ip4:192.0.2.0/24 ip6:2001:db8::/32 +all", "+", 4, nil, 0, true},
-		{"v=spf1 a/24 mx:mail.x.test/24 ?all", "?", 2, nil, 0, false},
-		{"v=spf1 ip4:192.0.2.1 redirect=_spf.x.test", "", 1, nil, 0, false},
+		{"v=spf1 -all", "-", 0, nil, 0, false, nil},
+		{"v=spf1 include:_spf.google.com ~all", "~", 1, []string{"_spf.google.com"}, 0, false, nil},
+		{"v=spf1 a mx ptr exists:%{i}.x.test ip4:192.0.2.0/24 ip6:2001:db8::/32 +all", "+", 4, nil, 0, true, nil},
+		{"v=spf1 a/24 mx:mail.x.test/24 ?all", "?", 2, nil, 0, false, nil},
+		{"v=spf1 ip4:192.0.2.1 redirect=_spf.x.test", "", 1, nil, 0, false, nil},
 		// redirect is ignored (and costs nothing) when there is an all term.
-		{"v=spf1 redirect=_spf.x.test -all", "-", 0, nil, 0, false},
-		{"v=spf1 INCLUDE:Upper.Test -ALL", "-", 1, []string{"upper.test"}, 0, false},
-		{"v=spf1 include: bogus -all", "-", 1, nil, 2, false},
-		{"v=spf1 exp=explain.x.test -all", "-", 0, nil, 0, false},
+		{"v=spf1 redirect=_spf.x.test -all", "-", 0, nil, 0, false, nil},
+		{"v=spf1 INCLUDE:Upper.Test -ALL", "-", 1, []string{"upper.test"}, 0, false, nil},
+		{"v=spf1 include: bogus -all", "-", 1, nil, 2, false, nil},
+		{"v=spf1 exp=explain.x.test -all", "-", 0, nil, 0, false, nil},
+		// The first all wins; later terms are never reached and cost nothing.
+		{"v=spf1 +all -all", "+", 0, nil, 0, false, []string{"-all"}},
+		{"v=spf1 include:_spf.first.test ~all include:big.first.test -all", "~", 1, []string{"_spf.first.test"}, 0, false,
+			[]string{"include:big.first.test", "-all"}},
+		{"v=spf1 -all a mx ptr", "-", 0, nil, 0, false, []string{"a", "mx", "ptr"}},
+		// A syntax error after all still breaks the record.
+		{"v=spf1 -all bogus include:", "-", 0, nil, 2, false, nil},
 	}
 	for _, tc := range cases {
 		r := parseSPF(tc.raw)
 		if r.All != tc.all || r.Lookups != tc.lookups || len(r.Unknown) != tc.unknown || r.HasPTR != tc.ptr {
 			t.Errorf("parseSPF(%q) = all %q lookups %d unknown %v ptr %v; want %q %d %d %v",
 				tc.raw, r.All, r.Lookups, r.Unknown, r.HasPTR, tc.all, tc.lookups, tc.unknown, tc.ptr)
+		}
+		if !slices.Equal(r.AfterAll, tc.after) {
+			t.Errorf("parseSPF(%q) after all = %q, want %q", tc.raw, r.AfterAll, tc.after)
 		}
 		if !slices.Equal(r.Includes, tc.includes) {
 			t.Errorf("parseSPF(%q) includes = %q, want %q", tc.raw, r.Includes, tc.includes)

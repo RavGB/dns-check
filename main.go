@@ -10,10 +10,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
+	"unicode"
+
+	"golang.org/x/net/idna"
 )
 
 const version = "0.1.0"
@@ -41,6 +46,10 @@ Usage:
   dns-check [flags] domain [domain ...]
   dns-check [flags] -f domains.txt
 
+A domain can also be given as a URL or an email address. A leading "www."
+is left off, because email and DNS settings belong to the domain itself; the
+www address is still checked as part of it.
+
 Examples:
   dns-check example.com
   dns-check -v example.com
@@ -61,8 +70,8 @@ Flags:
                    dkim,mail,smtp,mxvault,protonmail,zoho,resend")
   -timeout time    how long to wait for each answer (default 3s)
   -concurrency n   most lookups in flight at once (default 16)
-  -v               also show how to fix each finding and list every record
-                   with each resolver's answer
+  -v               also show how to fix each finding and list every record,
+                   with each resolver's answer where they differ or failed
   -version         print the version and exit
   -h               show this help
 
@@ -113,13 +122,28 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return exitError
 	}
 
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			fmt.Fprint(stdout, usageText)
-			return exitOK
+	// Flags may come before or after the domains, so "dns-check example.com -v"
+	// works too. Everything after "--" is a domain.
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				fmt.Fprint(stdout, usageText)
+				return exitOK
+			}
+			fmt.Fprintln(stderr, "Run dns-check -h for help.")
+			return exitError
 		}
-		fmt.Fprintln(stderr, "Run dns-check -h for help.")
-		return exitError
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		if n := len(args) - len(rest); n > 0 && args[n-1] == "--" {
+			positional = append(positional, rest...)
+			break
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
 	if o.version {
 		fmt.Fprintf(stdout, "dns-check %s\n", version)
@@ -133,7 +157,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 
 	var raw []string
-	raw = append(raw, fs.Args()...)
+	raw = append(raw, positional...)
 	if o.file != "" {
 		lines, err := readDomainFile(o.file, stdin)
 		if err != nil {
@@ -145,15 +169,17 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return usageError("give at least one domain, for example: dns-check example.com")
 	}
 	var domains []string
+	inputNotes := map[string]string{}
 	seen := map[string]bool{}
 	for _, r := range raw {
-		d, err := normalizeDomain(r)
+		d, note, err := normalizeDomain(r)
 		if err != nil {
 			return usageError("%v", err)
 		}
 		if !seen[d] {
 			seen[d] = true
 			domains = append(domains, d)
+			inputNotes[d] = note
 		}
 	}
 
@@ -177,6 +203,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	errs := make([]error, len(domains))
 	runBounded(ctx, len(domains), domainParallel, func(ctx context.Context, i int) {
 		reports[i], errs[i] = checkDomain(ctx, client, resolvers, domains[i], cfg)
+		if errs[i] == nil {
+			reports[i].InputNote = inputNotes[domains[i]]
+		}
 	})
 
 	code := exitOK
@@ -237,8 +266,15 @@ func readDomainFile(path string, stdin io.Reader) ([]string, error) {
 	}
 	var out []string
 	sc := bufio.NewScanner(r)
+	first := true
 	for sc.Scan() {
-		line, _, _ := strings.Cut(sc.Text(), "#")
+		text := sc.Text()
+		if first {
+			// Windows Notepad starts UTF-8 files with a byte order mark.
+			text = strings.TrimPrefix(text, "\ufeff")
+			first = false
+		}
+		line, _, _ := strings.Cut(text, "#")
 		if line = strings.TrimSpace(line); line != "" {
 			out = append(out, line)
 		}
@@ -250,10 +286,13 @@ func readDomainFile(path string, stdin io.Reader) ([]string, error) {
 }
 
 // normalizeDomain accepts a domain, a URL or an email address and returns
-// the bare domain in lowercase.
-func normalizeDomain(s string) (string, error) {
-	orig := s
-	s = strings.ToLower(strings.TrimSpace(s))
+// the bare domain in lowercase ASCII. A leading "www." is left off, because
+// email and DNS settings belong to the domain itself. Names in other scripts
+// are turned into their xn-- form. note says, in plain words, what was
+// changed in a way the user might not expect; it is empty otherwise.
+func normalizeDomain(input string) (domain, note string, err error) {
+	orig := strings.TrimSpace(strings.TrimPrefix(input, "\ufeff"))
+	s := strings.ToLower(orig)
 	for _, prefix := range []string{"https://", "http://"} {
 		s = strings.TrimPrefix(s, prefix)
 	}
@@ -263,27 +302,56 @@ func normalizeDomain(s string) (string, error) {
 	if i := strings.LastIndex(s, "@"); i >= 0 {
 		s = s[i+1:]
 	}
+	if isIPAddress(s) {
+		return "", "", fmt.Errorf("%q is an IP address; give a domain name instead, for example example.com", orig)
+	}
 	if i := strings.LastIndex(s, ":"); i >= 0 {
 		s = s[:i]
 	}
 	s = strings.TrimSuffix(s, ".")
 	if s == "" {
-		return "", fmt.Errorf("%q is not a domain", orig)
+		return "", "", fmt.Errorf("%q is not a domain", orig)
 	}
-	for _, r := range s {
-		if r > 127 {
-			return "", fmt.Errorf("%q has non-ASCII letters; use its xn-- form (punycode) instead", orig)
+	if isIPAddress(s) {
+		return "", "", fmt.Errorf("%q is an IP address; give a domain name instead, for example example.com", orig)
+	}
+	var notes []string
+	if rest, ok := strings.CutPrefix(s, "www."); ok && strings.Contains(rest, ".") {
+		notes = append(notes, fmt.Sprintf("Checking %s, not %s: email and DNS settings belong to the domain itself, and its www address is checked as part of it.", rest, s))
+		s = rest
+	}
+	if strings.ContainsFunc(s, func(r rune) bool { return r > unicode.MaxASCII }) {
+		ascii, err := idna.Lookup.ToASCII(s)
+		if err != nil {
+			return "", "", fmt.Errorf("%q is not a valid domain name", orig)
 		}
+		notes = append(notes, fmt.Sprintf("%s is written %s in DNS.", s, ascii))
+		s = ascii
 	}
 	if len(s) > 253 || !strings.Contains(s, ".") {
-		return "", fmt.Errorf("%q is not a domain (expected something like example.com)", orig)
+		return "", "", fmt.Errorf("%q is not a domain (expected something like example.com)", orig)
 	}
-	for _, label := range strings.Split(s, ".") {
+	labels := strings.Split(s, ".")
+	for _, label := range labels {
 		if !validLabel(label) {
-			return "", fmt.Errorf("%q is not a valid domain", orig)
+			return "", "", fmt.Errorf("%q is not a valid domain", orig)
 		}
 	}
-	return s, nil
+	if strings.Trim(labels[len(labels)-1], "0123456789") == "" {
+		// No top-level domain is all digits; this is an address or a typo.
+		return "", "", fmt.Errorf("%q is not a domain (expected something like example.com)", orig)
+	}
+	return s, strings.Join(notes, " "), nil
+}
+
+// isIPAddress reports whether s is an IP address, with or without a port
+// or square brackets.
+func isIPAddress(s string) bool {
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	_, err := netip.ParseAddr(strings.Trim(s, "[]"))
+	return err == nil
 }
 
 func validLabel(l string) bool {

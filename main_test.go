@@ -186,24 +186,124 @@ func TestNormalizeDomain(t *testing.T) {
 	good := map[string]string{
 		"example.com":                     "example.com",
 		"  Example.COM. ":                 "example.com",
-		"https://www.example.com/a?b=c":   "www.example.com",
+		"https://www.example.com/a?b=c":   "example.com",
+		"www.example.com":                 "example.com",
+		"WWW.Example.co.uk":               "example.co.uk",
+		"www.com":                         "www.com", // nothing left to check without www
+		"shop.example.com":                "shop.example.com",
 		"http://example.com:8080":         "example.com",
 		"someone@example.co.uk":           "example.co.uk",
 		"xn--bcher-kva.example":           "xn--bcher-kva.example",
+		"bücher.example":                  "xn--bcher-kva.example",
+		"https://www.Bücher.example/":     "xn--bcher-kva.example",
+		"\ufeffexample.com":               "example.com",
 		"_dmarc.example.com":              "_dmarc.example.com",
 		"mailto:hello@example.org":        "example.org",
 		"https://user@example.net/path#x": "example.net",
 	}
 	for in, want := range good {
-		got, err := normalizeDomain(in)
+		got, note, err := normalizeDomain(in)
 		if err != nil || got != want {
 			t.Errorf("normalizeDomain(%q) = %q, %v; want %q", in, got, err, want)
 		}
+		lower := strings.ToLower(in)
+		switch {
+		case strings.Contains(lower, "www.") && want != "www.com":
+			if !strings.Contains(note, "not www.") {
+				t.Errorf("normalizeDomain(%q) note = %q, want it to say www was left off", in, note)
+			}
+		case strings.Contains(lower, "ü"):
+			if !strings.Contains(note, "xn--bcher-kva.example") {
+				t.Errorf("normalizeDomain(%q) note = %q, want the xn-- form", in, note)
+			}
+		default:
+			if note != "" {
+				t.Errorf("normalizeDomain(%q) note = %q, want none", in, note)
+			}
+		}
 	}
-	for _, in := range []string{"", "localhost", "exa mple.com", "-bad.com", "bücher.example", "a..b", strings.Repeat("a", 64) + ".com"} {
-		if got, err := normalizeDomain(in); err == nil {
+	bad := []string{"", "localhost", "exa mple.com", "-bad.com", "a..b", strings.Repeat("a", 64) + ".com",
+		"1.2.3.4", "1.2.3.4:53", "http://192.0.2.1/x", "2001:db8::1", "[2001:db8::1]:53", "example.123", "a\u202eb.example"}
+	for _, in := range bad {
+		if got, _, err := normalizeDomain(in); err == nil {
 			t.Errorf("normalizeDomain(%q) = %q, want an error", in, got)
 		}
+	}
+	if _, _, err := normalizeDomain("1.2.3.4"); err == nil || !strings.Contains(err.Error(), "IP address") {
+		t.Errorf("normalizeDomain(1.2.3.4) error = %v, want it to say it is an IP address", err)
+	}
+}
+
+func TestRunWWWURLChecksTheDomain(t *testing.T) {
+	srv := startFakeDNS(t, goodZone("good.test"))
+	code, stdout, stderr := runCLI(t, "", "-resolvers", srv.addr, "https://www.good.test/contact")
+	if code != exitOK {
+		t.Errorf("exit code = %d, want 0; stderr: %s\n%s", code, stderr, stdout)
+	}
+	for _, want := range []string{
+		"DNS and email check for good.test\n",
+		"Checking good.test, not www.good.test",
+		"www.good.test works",
+		"  Unlikely: DMARC is set to reject",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("report does not contain %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "www.www.") || strings.Contains(stdout, "_dmarc.www.") {
+		t.Errorf("report still checks the www host:\n%s", stdout)
+	}
+	code, stdout, _ = runCLI(t, "", "-json", "-resolvers", srv.addr, "www.good.test")
+	var out jsonOutput
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil || code != exitOK {
+		t.Fatalf("code %d, err %v", code, err)
+	}
+	if rep := out.Results[0].Report; rep.Domain != "good.test" || !strings.Contains(rep.InputNote, "not www.good.test") {
+		t.Errorf("JSON domain %q note %q", rep.Domain, rep.InputNote)
+	}
+}
+
+func TestRunFlagsAfterDomain(t *testing.T) {
+	srv := startFakeDNS(t, goodZone("good.test"))
+	code, stdout, stderr := runCLI(t, "", "good.test", "-v", "-resolvers", srv.addr)
+	if code != exitOK || !strings.Contains(stdout, "Records\n") {
+		t.Errorf("good.test -v: code %d stderr %q\n%s", code, stderr, stdout)
+	}
+	code, stdout, _ = runCLI(t, "", "-resolvers", srv.addr, "good.test", "-json")
+	if code != exitOK || !json.Valid([]byte(stdout)) {
+		t.Errorf("good.test -json: code %d\n%s", code, stdout)
+	}
+	// After "--", everything is a domain, so "-v" is rejected as one.
+	code, _, stderr = runCLI(t, "", "-resolvers", srv.addr, "--", "good.test", "-v")
+	if code != exitError || !strings.Contains(stderr, `"-v" is not a domain`) {
+		t.Errorf("after --: code %d stderr %q", code, stderr)
+	}
+}
+
+func TestRunOneResolverWording(t *testing.T) {
+	srv := startFakeDNS(t, goodZone("good.test"))
+	_, stdout, _ := runCLI(t, "", "-resolvers", srv.addr, "good.test")
+	if !strings.Contains(stdout, " with 1 resolver: ") || strings.Contains(stdout, "1 resolvers") {
+		t.Errorf("header should say \"1 resolver\":\n%s", stdout)
+	}
+}
+
+func TestReadDomainFileSkipsByteOrderMark(t *testing.T) {
+	list := filepath.Join(t.TempDir(), "domains.txt")
+	if err := os.WriteFile(list, []byte("\ufeffgood.test\r\n# note\r\nother.test\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readDomainFile(list, nil)
+	if err != nil || !slices.Equal(got, []string{"good.test", "other.test"}) {
+		t.Errorf("readDomainFile = %q, %v", got, err)
+	}
+}
+
+func TestPrintableHidesTerminalTricks(t *testing.T) {
+	in := "a\x1b[31mb\u009b2Jc\u202ed\u2028e\u200bf\u00e9"
+	got := printable(in)
+	if got != "a?[31mb?2Jc?d?e?f\u00e9" {
+		t.Errorf("printable(%q) = %q", in, got)
 	}
 }
 

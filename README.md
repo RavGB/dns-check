@@ -16,7 +16,9 @@ the question most business owners actually care about:
 - The domain's address (A) and IPv6 address (AAAA). If the bare domain points
   nowhere, typing it without www shows an error.
 - `www` (CNAME and A). People type both. A www record that points at a name
-  with no address (an old host you left) is flagged.
+  with no address (an old host you left) is flagged. A CNAME chain is shown in
+  order. For a subdomain (a name with no name servers of its own, such as
+  shop.example.com) the www check is skipped.
 
 **Name servers**
 - NS and SOA. With only one name server, the whole domain goes dark if it fails.
@@ -29,14 +31,19 @@ the question most business owners actually care about:
 - **SPF**, the list of servers allowed to send your email. Flags: missing,
   more than one SPF record (that breaks SPF entirely), ending in `+all` (anyone
   may send as you), `?all` (says nothing), no `all` rule at all, and `~all`
-  versus `-all`. It also counts the DNS lookups the record needs, following
-  `include:` and `redirect=` into other domains (up to 10 levels deep). Over 10
-  lookups, receivers may treat SPF as broken. Includes that point at a domain
-  with no SPF record are flagged too.
+  versus `-all`. Receivers stop reading at the first `all`, so anything after
+  it is ignored; that is flagged too. It counts the DNS lookups the record
+  needs, following `include:` and `redirect=` into other domains (up to 10
+  levels deep). Over 10 lookups, or an include that points at a domain with no
+  SPF record (or more than one), receivers treat SPF as broken, and the report
+  says so.
 - **DMARC**, the rule that tells receivers what to do with email that fails the
   checks. Flags: missing, `p=none` (monitoring only, fakes still delivered),
   `p=quarantine` (fakes go to spam), `p=reject` (fakes refused), `pct` below
-  100, `sp=none`, and whether reports (`rua=`) are being collected.
+  100, `sp=none`, and whether reports (`rua=`) are being collected. When a
+  subdomain has no DMARC record of its own, the nearest parent domain's record
+  applies (its `sp=` policy, or `p=` when there is no `sp=`), and the report
+  says where the policy came from.
 - **DKIM**, the signature on your outgoing email. It looks for keys at these
   common selector names: default, selector1, selector2, google, k1, s1, s2,
   dkim, mail, smtp, mxvault, protonmail, zoho, resend. Use `-selectors` to try
@@ -47,7 +54,13 @@ the question most business owners actually care about:
 
 **Domain security**
 - **CAA**: which certificate authorities may issue certificates for the domain.
+  A subdomain without CAA records of its own is covered by its parent's.
 - **DNSSEC**: whether the domain is signed (a DS record exists at the registry).
+  A subdomain without name servers of its own shares the DNSSEC of the zone it
+  lives in. When the domain is signed but most resolvers answer with an error
+  (SERVFAIL) for it, the report says DNSSEC looks broken. Resolvers that check
+  DNSSEC do that when they cannot verify the zone's answers, for example when
+  the DS record at the registrar no longer matches the zone's keys.
 
 **Resolvers**
 - By default it asks your computer's own resolver plus Cloudflare (1.1.1.1),
@@ -57,14 +70,28 @@ the question most business owners actually care about:
   because content delivery networks (CDNs) do that on purpose.
 - If a resolver cannot be reached, the report says so and the check carries
   on with the others.
+- If some resolvers say the domain does not exist while others see it, the
+  report says which resolver sees what (a new or moved domain is usually still
+  spreading) and uses the answers from the resolvers that see it.
+- If no resolver gives a usable answer for a key record (SOA, NS, MX, the TXT
+  record that holds SPF, or DMARC), that is a warning. So a "Not sure"
+  spoofing answer never comes with exit code 0.
+- Differences in the SOA serial number alone are ignored. Many DNS providers
+  change it on every edit.
 
 **The spoofing answer**
+
+The question is about the From line people see in their inbox. Only DMARC
+tells receivers to check that line. SPF on its own checks a hidden sender
+address that a faker can set to any domain they own, so SPF alone does not
+stop a fake From line.
+
 - **Unlikely**: DMARC is set to reject or quarantine for all email, and SPF
   does not end in `+all`.
 - **Partly**: DMARC enforcement covers only part of the email (`pct` below
-  100), or SPF is set up but DMARC is missing or only monitoring.
-- **Yes**: SPF ends in `+all`, or there is neither a working SPF record nor an
-  enforcing DMARC policy.
+  100).
+- **Yes**: SPF ends in `+all`, or DMARC is missing, not valid, or only
+  monitoring (`p=none`), whatever SPF says.
 - **Not sure**: only when the SPF or DMARC lookups failed on every resolver,
   or the domain does not exist in DNS.
 
@@ -87,7 +114,13 @@ dns-check -f domains.txt                  # one domain per line, "#" starts a co
 ```
 
 You can pass a bare domain, a URL (`https://www.example.com/contact`) or an
-email address (`hello@example.com`); it keeps just the domain part.
+email address (`hello@example.com`); it keeps just the domain part. A leading
+`www.` is left off, because email and DNS settings belong to the domain
+itself, and the report says so; the www address is still checked as part of
+the domain. So `https://www.example.com/contact` checks `example.com`. Names in
+other scripts, such as `bücher.example`, are checked in their `xn--` form. An
+IP address is refused, because there is no domain to check. Flags can go
+before or after the domains.
 
 Flags:
 
@@ -99,20 +132,20 @@ Flags:
 | `-selectors list` | comma separated DKIM selector names to try (default: the list above) |
 | `-timeout time` | how long to wait for each answer (default `3s`) |
 | `-concurrency n` | most lookups in flight at once (default `16`) |
-| `-v` | also show how to fix each finding and list every record with each resolver's answer |
+| `-v` | also show how to fix each finding and list every record, with each resolver's answer where they differ or failed |
 | `-version` | print the version |
 | `-h` | show help |
 
 ## Sample output
 
-This is a real run against ravgb.com on 2026-11-13, copied as printed:
+This is a real run against ravgb.com on 2026-11-13, copied as printed. It asks
+only the three public resolvers, so no private resolver address appears:
 
 ```
-$ dns-check ravgb.com
+$ dns-check -resolvers 1.1.1.1,8.8.8.8,9.9.9.9 ravgb.com
 DNS and email check for ravgb.com
-Checked 2026-11-13 18:14 UTC with 4 resolvers: System resolver
-(2001:4e8:0:4001::17), Cloudflare (1.1.1.1), Google (8.8.8.8) and Quad9
-(9.9.9.9).
+Checked 2026-11-13 18:48 UTC with 3 resolvers: Cloudflare (1.1.1.1), Google
+(8.8.8.8) and Quad9 (9.9.9.9).
 Summary: 0 problems, 1 warning, 5 notes, 7 things look good.
 
 Website
@@ -149,11 +182,13 @@ Domain security
             this domain.
 
 Resolvers
-  [ok]      All 4 resolvers that answered gave the same answers.
+  [ok]      All 3 resolvers gave the same answers.
 
 Could someone send email that looks like it comes from ravgb.com?
-  Partly: SPF catches some fakes, but DMARC is set to monitoring only (p=none),
-  so nothing stops a fake that shows ravgb.com in the From line people see.
+  Yes: DMARC is set to monitoring only (p=none), so nothing tells receiving mail
+  servers to block a fake that shows ravgb.com in the From line people see. SPF
+  is set up, but on its own it only stops fakes that also forge the hidden
+  sender address, which a faker does not need to do.
 
 Top fixes
   1. Add rua=mailto:<a mailbox you read> to the DMARC record so you get reports,
@@ -181,9 +216,13 @@ With several domains, the highest code wins.
 `results`. Each result has the `domain` and either an `error` or a `report`.
 A report holds every record with each resolver's answer (`per_resolver`), the
 answer most resolvers gave (`values`), whether they agreed, the SPF and DMARC
-details, the DKIM selectors found, every finding (`severity` is one of `ok`,
-`note`, `warning`, `problem`, plus a stable `code` such as `spf_plus_all`),
-the spoofing answer, and the fixes.
+details (for DMARC, `found_at` says where the record is and `applied_policy`
+the policy that applies to this domain), the DKIM selectors found, every
+finding (`severity` is one of `ok`, `note`, `warning`, `problem`, plus a
+stable `code` such as `spf_plus_all`), the spoofing answer, and the fixes.
+`input_note` says when the input was changed (for example a `www.` left off),
+and `not_seen_by` lists resolvers that said the domain does not exist while
+others saw it.
 
 ## How it works
 
@@ -199,8 +238,9 @@ the spoofing answer, and the fixes.
   times without a single answer is skipped for the rest of the run.
 - It only talks DNS. It makes no HTTP requests.
 
-The only dependency outside the Go standard library is `golang.org/x/net`,
-used for its `dns/dnsmessage` package.
+The only dependencies outside the Go standard library are `golang.org/x/net`,
+used for its `dns/dnsmessage` and `idna` packages, and `golang.org/x/text`,
+which `idna` uses.
 
 ## What it does not check
 
@@ -210,8 +250,11 @@ used for its `dns/dnsmessage` package.
 - It does not check DKIM key strength, send test email, or test whether your
   mail servers accept email or offer valid encryption.
 - It only finds DKIM keys at the selector names it tries.
-- It checks the exact name you give. For a subdomain, it does not look up the
-  DMARC policy or CAA records the parent domain may pass down.
+- It checks the name you give, apart from a leading `www.`. For a subdomain,
+  it looks for the parent's DMARC, CAA and DNSSEC as described above, going up
+  to names with two labels. It does not use the full Public Suffix List: it
+  skips common shared suffixes such as `co.uk`, `com.au` or `on.ca`, but an
+  unusual shared suffix could be treated as a parent domain.
 - It counts the SPF terms that cost a DNS lookup. It does not evaluate SPF for
   a particular sending server, and it does not count the extra address lookups
   inside `mx` and `ptr` or "void" lookups.

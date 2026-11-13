@@ -9,7 +9,9 @@ import (
 // spfRecord is a parsed SPF record (RFC 7208).
 type spfRecord struct {
 	Raw      string
-	All      string // qualifier of the "all" term: "+", "-", "~", "?", or "" when there is none
+	All      string   // qualifier of the first "all" term: "+", "-", "~", "?", or "" when there is none
+	AllTerm  string   // the first "all" term as written, for example "-all"
+	AfterAll []string // mechanisms after the first "all"; receivers never reach them
 	Redirect string
 	Includes []string
 	Lookups  int      // terms in this record that cost a DNS lookup
@@ -26,6 +28,10 @@ func isSPF(s string) bool {
 
 // parseSPF reads the terms of an SPF record and counts the ones that need a
 // DNS lookup: include, a, mx, ptr, exists, and the redirect modifier.
+// Receivers read mechanisms from left to right and the first "all" always
+// matches, so mechanisms after it are never used and cost no lookups (RFC
+// 7208 section 5.1). They are still checked for syntax, because a syntax
+// error anywhere breaks the whole record.
 func parseSPF(raw string) spfRecord {
 	rec := spfRecord{Raw: raw}
 	fields := strings.Fields(raw)
@@ -53,9 +59,25 @@ func parseSPF(raw string) spfRecord {
 				arg = lower[i+1:]
 			}
 		}
+		if rec.AllTerm != "" {
+			switch name {
+			case "all", "a", "mx", "ptr", "exists", "ip4", "ip6":
+				rec.AfterAll = append(rec.AfterAll, term)
+			case "include":
+				if arg != "" {
+					rec.AfterAll = append(rec.AfterAll, term)
+				} else {
+					rec.Unknown = append(rec.Unknown, term)
+				}
+			default:
+				rec.Unknown = append(rec.Unknown, term)
+			}
+			continue
+		}
 		switch name {
 		case "all":
 			rec.All = qualifier
+			rec.AllTerm = term
 		case "include":
 			rec.Lookups++
 			if arg == "" {

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -90,12 +91,25 @@ func (e *RCodeError) Error() string {
 
 var errNoAnswer = errors.New("no answer in time")
 
+// tcpRetryError means the UDP answer was truncated and asking again over TCP
+// failed, for example because a firewall blocks DNS over TCP.
+type tcpRetryError struct{ err error }
+
+func (e *tcpRetryError) Error() string {
+	return "the answer was too big for UDP and the TCP retry failed: " + e.err.Error()
+}
+
+func (e *tcpRetryError) Unwrap() error { return e.err }
+
 // Client sends DNS queries over UDP, falling back to TCP when an answer is
 // truncated. A shared semaphore caps how many queries are in flight across
 // the whole run, no matter how many goroutines call Query.
 type Client struct {
 	Timeout time.Duration
 	sem     chan struct{}
+
+	mu     sync.Mutex
+	health map[string]*resolverHealth // keyed by resolver addresses
 }
 
 // NewClient returns a client that waits up to timeout for each answer and
@@ -191,7 +205,7 @@ func (c *Client) exchange(ctx context.Context, addr string, q dnsmessage.Questio
 	if h.Truncated {
 		raw, err = exchangeTCP(ctx, addr, msg, id, q)
 		if err != nil {
-			return nil, fmt.Errorf("the answer was too big for UDP and the TCP retry failed: %w", err)
+			return nil, &tcpRetryError{err: err}
 		}
 		usedTCP = true
 	}
@@ -434,9 +448,12 @@ func isTimeout(err error) bool {
 // plainError turns a lookup error into short, plain words.
 func plainError(err error) string {
 	var rc *RCodeError
+	var tcp *tcpRetryError
 	switch {
 	case err == nil:
 		return ""
+	case errors.As(err, &tcp):
+		return "the answer was too big for UDP and the TCP retry failed (" + plainError(tcp.err) + ")"
 	case errors.As(err, &rc):
 		return rc.Error()
 	case errors.Is(err, errSkipped):
@@ -447,6 +464,10 @@ func plainError(err error) string {
 		return "stopped before an answer came back"
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "connection refused"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection reset"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "connection closed before an answer came back"
 	case errors.Is(err, syscall.ENETUNREACH):
 		return "network unreachable"
 	case errors.Is(err, syscall.EHOSTUNREACH):

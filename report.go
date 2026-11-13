@@ -6,6 +6,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"unicode"
 )
 
 const wrapWidth = 80
@@ -39,11 +40,18 @@ func writeText(w io.Writer, rep *Report, verbose bool) {
 	p := func(format string, args ...any) { fmt.Fprintf(w, format, args...) }
 
 	p("DNS and email check for %s\n", rep.Domain)
+	if rep.InputNote != "" {
+		p("%s", wrap(printable(rep.InputNote), "", ""))
+	}
 	var names []string
 	for _, st := range rep.Resolvers {
 		names = append(names, st.Name)
 	}
-	p("%s", wrap(fmt.Sprintf("Checked %s with %d resolvers: %s.", rep.CheckedAt.Format("2006-01-02 15:04 MST"), len(names), joinAnd(names)), "", ""))
+	resolverWord := "resolvers"
+	if len(names) == 1 {
+		resolverWord = "resolver"
+	}
+	p("%s", wrap(printable(fmt.Sprintf("Checked %s with %d %s: %s.", rep.CheckedAt.Format("2006-01-02 15:04 MST"), len(names), resolverWord, joinAnd(names))), "", ""))
 	p("%s\n", wrap(summaryLine(rep.Findings), "", ""))
 
 	for _, area := range areaOrder {
@@ -99,21 +107,18 @@ func writeText(w io.Writer, rep *Report, verbose bool) {
 	}
 }
 
-// writeRecords lists every record and, where resolvers disagree, each answer.
+// writeRecords lists every record and, where resolvers disagree or failed,
+// each resolver's answer.
 func writeRecords(w io.Writer, rep *Report) {
 	fmt.Fprintf(w, "Records\n")
 	for _, r := range rep.Records {
 		fmt.Fprintf(w, "  %s, %s\n", r.Label, r.Name)
-		if !r.Answered {
-			fmt.Fprintf(w, "      no resolver answered\n")
-			continue
-		}
-		if r.Agree {
+		if r.Answered && r.Agree {
 			writeValues(w, r.Values, "      ")
 			continue
 		}
 		for _, ra := range r.PerResolver {
-			fmt.Fprintf(w, "    %s:\n", ra.Resolver)
+			fmt.Fprintf(w, "    %s:\n", printable(ra.Resolver))
 			if ra.Error != "" {
 				fmt.Fprintf(w, "      failed: %s\n", ra.Error)
 				continue
@@ -174,10 +179,12 @@ func wrap(text, first, rest string) string {
 	return b.String()
 }
 
-// printable replaces control characters so DNS data cannot mess with the terminal.
+// printable replaces control characters, invisible format characters (such
+// as right-to-left overrides) and line separators, so text from DNS cannot
+// change how the report looks in a terminal.
 func printable(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			return '?'
 		}
 		return r

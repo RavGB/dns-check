@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // Severity says how much a finding matters.
@@ -92,6 +95,7 @@ type ResolverAnswer struct {
 	NotFound bool     `json:"nxdomain,omitempty"`
 	UsedTCP  bool     `json:"used_tcp,omitempty"`
 	Error    string   `json:"error,omitempty"`
+	servFail bool     // the resolver answered SERVFAIL
 }
 
 // RecordReport is one record lookup across all resolvers.
@@ -120,8 +124,10 @@ type SPFSummary struct {
 // DMARCSummary is the DMARC part of the report.
 type DMARCSummary struct {
 	Record          string   `json:"record"`
+	FoundAt         string   `json:"found_at"` // where the record is: _dmarc.<domain>, or a parent domain's
 	Policy          string   `json:"policy"`
 	SubdomainPolicy string   `json:"subdomain_policy,omitempty"`
+	AppliedPolicy   string   `json:"applied_policy"` // the policy that applies to this domain
 	Pct             int      `json:"pct"`
 	Reports         []string `json:"rua"`
 }
@@ -129,7 +135,9 @@ type DMARCSummary struct {
 // Report is everything found for one domain.
 type Report struct {
 	Domain        string           `json:"domain"`
+	InputNote     string           `json:"input_note,omitempty"` // how the input was changed, for example a www. left off
 	CheckedAt     time.Time        `json:"checked_at"`
+	NotSeenBy     []string         `json:"not_seen_by,omitempty"` // resolvers that say the domain does not exist, while others see it
 	Resolvers     []ResolverStatus `json:"resolvers"`
 	Records       []RecordReport   `json:"records"`
 	SPF           *SPFSummary      `json:"spf"`
@@ -206,6 +214,8 @@ func buildRecords(resolvers []Resolver, results []QueryResult) []RecordReport {
 			}
 			if l.Err != nil {
 				ra.Error = plainError(l.Err)
+				var rc *RCodeError
+				ra.servFail = errors.As(l.Err, &rc) && rc.RCode == dnsmessage.RCodeServerFailure
 			} else {
 				rr.Answered = true
 				rr.TTL = max(rr.TTL, l.TTL)
@@ -257,36 +267,41 @@ func resolverStatuses(resolvers []Resolver, results []QueryResult) ([]ResolverSt
 
 // fixRank orders fixes: lower comes first among findings of equal severity.
 var fixRank = map[string]int{
-	"domain_not_found":     0,
-	"spf_plus_all":         1,
-	"spf_multiple":         2,
-	"dmarc_multiple":       3,
-	"dmarc_invalid":        3,
-	"spf_missing":          4,
-	"dmarc_missing":        5,
-	"spf_too_many_lookups": 6,
-	"spf_syntax":           7,
-	"dmarc_none":           10,
-	"spf_neutral_all":      11,
-	"spf_no_all":           12,
-	"spf_include_missing":  13,
-	"no_mx":                14,
-	"apex_no_address":      15,
-	"www_missing":          16,
-	"www_dangling":         16,
-	"resolvers_disagree":   17,
-	"dmarc_pct":            18,
-	"dmarc_sp_none":        19,
-	"ns_single":            20,
-	"dmarc_no_rua":         30,
-	"dkim_none_found":      31,
-	"spf_softfail":         32,
-	"caa_missing":          33,
-	"dnssec_off":           34,
-	"mta_sts_missing":      35,
-	"tls_rpt_missing":      36,
-	"spf_ptr":              37,
-	"bimi_missing":         38,
+	"domain_not_found":      0,
+	"dnssec_broken":         0,
+	"domain_not_everywhere": 0,
+	"spf_plus_all":          1,
+	"spf_multiple":          2,
+	"dmarc_multiple":        3,
+	"dmarc_invalid":         3,
+	"spf_missing":           4,
+	"dmarc_missing":         5,
+	"spf_too_many_lookups":  6,
+	"spf_syntax":            7,
+	"lookup_failed":         8,
+	"zone_servfail":         9,
+	"dmarc_none":            10,
+	"spf_neutral_all":       11,
+	"spf_no_all":            12,
+	"spf_include_missing":   13,
+	"spf_after_all":         13,
+	"no_mx":                 14,
+	"apex_no_address":       15,
+	"www_missing":           16,
+	"www_dangling":          16,
+	"resolvers_disagree":    17,
+	"dmarc_pct":             18,
+	"dmarc_sp_none":         19,
+	"ns_single":             20,
+	"dmarc_no_rua":          30,
+	"dkim_none_found":       31,
+	"spf_softfail":          32,
+	"caa_missing":           33,
+	"dnssec_off":            34,
+	"mta_sts_missing":       35,
+	"tls_rpt_missing":       36,
+	"spf_ptr":               37,
+	"bimi_missing":          38,
 }
 
 func rankOf(code string) int {
@@ -354,32 +369,67 @@ const (
 type dmarcState struct {
 	known   bool
 	present bool
-	policy  string // "" when missing or not valid
+	policy  string // the policy that applies; "" when missing or not valid
+	tag     string // "p", or "sp" when a parent domain's subdomain policy applies
 	pct     int
 }
 
 type analyzer struct {
 	rep *Report
+	// subdomain is true when the name has no name servers of its own, so it
+	// lives inside a parent domain's DNS.
+	subdomain bool
 }
 
 func (a *analyzer) add(sev Severity, area, code, msg, fix string) {
 	a.rep.Findings = append(a.rep.Findings, Finding{Severity: sev, Area: area, Code: code, Message: msg, Fix: fix})
 }
 
-// unknown adds a note and returns true when no resolver could answer.
+// coreIDs are the records the main answers depend on. When they cannot be
+// looked up at all, the report cannot be trusted, so that is a warning.
+var coreIDs = map[string]bool{"soa": true, "ns": true, "mx": true, "txt": true, "dmarc": true}
+
+// unknown adds a finding and returns true when no resolver gave a usable
+// answer for the record.
 func (a *analyzer) unknown(r *RecordReport, area string) bool {
 	if r.Answered {
 		return false
 	}
-	a.add(SevNote, area, "lookup_failed", fmt.Sprintf("Could not look up the %s for %s, because no resolver answered.", r.Label, r.Name), "")
+	var why []string
+	for _, ra := range r.PerResolver {
+		if ra.Error != "" && !slices.Contains(why, ra.Error) {
+			why = append(why, ra.Error)
+		}
+	}
+	msg := fmt.Sprintf("Could not look up the %s for %s. None of the resolvers gave a usable answer: %s.", r.Label, r.Name, strings.Join(why, "; "))
+	if coreIDs[r.ID] || strings.HasPrefix(r.ID, "parent-dmarc:") {
+		a.add(SevWarning, area, "lookup_failed", msg,
+			"Run the check again in a few minutes. If the same lookups keep failing, ask your DNS provider to check that the domain's name servers are answering.")
+	} else {
+		a.add(SevNote, area, "lookup_failed", msg, "")
+	}
 	return true
+}
+
+// parents returns the parent-domain lookups of one kind ("parent-dmarc:",
+// "parent-caa:" or "parent-ds:"), nearest parent first.
+func (a *analyzer) parents(prefix string) []*RecordReport {
+	var out []*RecordReport
+	for i := range a.rep.Records {
+		if strings.HasPrefix(a.rep.Records[i].ID, prefix) {
+			out = append(out, &a.rep.Records[i])
+		}
+	}
+	return out
 }
 
 // analyze turns the records into findings, the spoofing verdict and fixes.
 func analyze(rep *Report, exp *spfExpansion) {
 	a := &analyzer{rep: rep}
 	a.resolvers()
-	if soa := rep.record("soa"); soa.Answered && soa.NotFound {
+	a.notSeen()
+	soa := rep.record("soa")
+	if soa.Answered && soa.NotFound {
 		a.add(SevProblem, areaDomain, "domain_not_found",
 			fmt.Sprintf("%s was not found in DNS. It may be misspelled, expired, or not registered.", rep.Domain),
 			"Check the spelling. If this is your domain, check with your registrar that it is registered, paid up, and pointed at your DNS provider.")
@@ -387,6 +437,10 @@ func analyze(rep *Report, exp *spfExpansion) {
 		rep.TopFixes, rep.OptionalFixes = topFixes(rep.Findings)
 		return
 	}
+	a.unknown(soa, areaDomain)
+	ns := rep.record("ns")
+	a.subdomain = ns.Answered && !ns.NotFound && len(ns.Values) == 0 && strings.Count(rep.Domain, ".") >= 2
+	dnssecBroken := a.zoneHealth()
 	a.website()
 	a.nameServers()
 	hasMail := a.mail()
@@ -394,23 +448,159 @@ func analyze(rep *Report, exp *spfExpansion) {
 	dmarc := a.dmarc()
 	a.dkim()
 	a.mailExtras(hasMail, dmarc)
-	a.domainSecurity()
+	a.domainSecurity(dnssecBroken)
 	a.disagreements()
 	rep.Spoofing = spoofVerdict(rep.Domain, spf, dmarc)
+	if dnssecBroken && rep.Spoofing.Answer == "Not sure" {
+		rep.Spoofing.Reason = "DNSSEC looks broken, so resolvers refuse to answer for this domain and SPF and DMARC could not be checked. Fix DNSSEC, then run the check again."
+	}
 	rep.TopFixes, rep.OptionalFixes = topFixes(rep.Findings)
 }
 
 func (a *analyzer) resolvers() {
-	for _, st := range a.rep.Resolvers {
+	for ri, st := range a.rep.Resolvers {
+		if slices.Contains(a.rep.NotSeenBy, st.Name) {
+			continue // notSeen explains these
+		}
 		switch {
 		case !st.Usable:
 			a.add(SevNote, areaResolvers, "resolver_unreachable",
 				fmt.Sprintf("Could not use %s: %s. The check carried on with the other resolvers.", st.Name, st.Error), "")
 		case st.Failed > 0:
-			a.add(SevNote, areaResolvers, "resolver_partial",
-				fmt.Sprintf("%s did not answer %d of %d lookups (%s). Answers from the other resolvers were used for those.", st.Name, st.Failed, st.Lookups, st.Error), "")
+			msg := fmt.Sprintf("%s gave no usable answer for %d of %d lookups (%s).", st.Name, st.Failed, st.Lookups, st.Error)
+			if a.coveredByOthers(ri) {
+				msg += " Where another resolver answered, its answer was used."
+			}
+			a.add(SevNote, areaResolvers, "resolver_partial", msg, "")
 		}
 	}
+}
+
+// coveredByOthers reports whether another resolver answered at least one of
+// the lookups resolver ri failed.
+func (a *analyzer) coveredByOthers(ri int) bool {
+	for _, r := range a.rep.Records {
+		if ri >= len(r.PerResolver) || r.PerResolver[ri].Error == "" {
+			continue
+		}
+		for j, ra := range r.PerResolver {
+			if j != ri && ra.Error == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// notSeen reports resolvers that say the domain does not exist while other
+// resolvers see it. Their answers were left out of the report.
+func (a *analyzer) notSeen() {
+	if len(a.rep.NotSeenBy) == 0 {
+		return
+	}
+	var seenBy []string
+	for _, ra := range a.rep.record("soa").PerResolver {
+		if ra.Error == "" {
+			seenBy = append(seenBy, ra.Resolver)
+		}
+	}
+	d := a.rep.Domain
+	not, does := "does not", "does"
+	if len(a.rep.NotSeenBy) > 1 {
+		not = "do not"
+	}
+	if len(seenBy) > 1 {
+		does = "do"
+	}
+	a.add(SevWarning, areaDomain, "domain_not_everywhere",
+		fmt.Sprintf("%s %s see %s yet, but %s %s. If you registered the domain or moved its DNS recently, the change is probably still spreading. This report uses the answers from the resolvers that see it.",
+			joinAnd(a.rep.NotSeenBy), not, d, joinAnd(seenBy), does),
+		"If you registered the domain or moved its DNS recently, wait a few hours and run this check again. If nothing changed, check with your registrar that the domain is registered and pointed at your DNS provider.")
+}
+
+// zoneHealth looks for resolvers that answer with an error (SERVFAIL) for
+// nearly every lookup about the domain while still answering other lookups,
+// such as the DS record, which the parent zone serves. For a signed domain
+// that almost always means DNSSEC is broken: validating resolvers refuse
+// answers they cannot verify. A resolver that fails every lookup is left
+// out, because that looks the same as a broken resolver. It returns true
+// when DNSSEC looks broken.
+func (a *analyzer) zoneHealth() bool {
+	d := a.rep.Domain
+	soa := a.rep.record("soa")
+	var failing []string
+	reachable := 0
+	for ri, st := range a.rep.Resolvers {
+		if !st.Usable {
+			continue
+		}
+		reachable++
+		if ri >= len(soa.PerResolver) || !soa.PerResolver[ri].servFail {
+			continue
+		}
+		own, fails := 0, 0
+		for _, r := range a.rep.Records {
+			if r.ID == "ds" || strings.HasPrefix(r.ID, "parent-") || ri >= len(r.PerResolver) {
+				continue
+			}
+			own++
+			if r.PerResolver[ri].servFail {
+				fails++
+			}
+		}
+		if fails*2 >= own {
+			failing = append(failing, st.Name)
+		}
+	}
+	if len(failing) == 0 {
+		return false
+	}
+	who := joinAnd(failing)
+	if signed, _, _ := a.signed(); signed {
+		fix := "Check the DNSSEC settings at your DNS provider and the DS record at your domain registrar: they must match. If you moved to a new DNS provider, remove the old DS record at the registrar (or replace it with the new provider's), then run this check again."
+		if len(failing)*2 > reachable {
+			a.add(SevProblem, areaDomain, "dnssec_broken",
+				fmt.Sprintf("DNSSEC looks broken. %s answered with an error (SERVFAIL) for almost every lookup about %s, even though the domain is signed (a DS record is published). Resolvers that check DNSSEC refuse answers they cannot verify, so many people may not be able to reach the website or send email to %s.", who, d, d),
+				fix)
+		} else {
+			a.add(SevWarning, areaDomain, "dnssec_broken",
+				fmt.Sprintf("DNSSEC may be broken. %s answered with an error (SERVFAIL) for almost every lookup about %s, while other resolvers answered normally. The domain is signed (a DS record is published), and resolvers that check DNSSEC refuse answers they cannot verify.", who, d),
+				fix)
+		}
+		return true
+	}
+	a.add(SevWarning, areaDomain, "zone_servfail",
+		fmt.Sprintf("%s answered with an error (SERVFAIL) for almost every lookup about %s. The domain's name servers may be failing for some resolvers, and people who use those resolvers may not be able to reach the website or send email to the domain.", who, d),
+		"Check with your DNS provider that every name server listed for the domain is working, then run this check again.")
+	return false
+}
+
+// signed reports whether DNSSEC is on for the domain and the name whose DS
+// record shows it. A subdomain without name servers of its own lives in the
+// zone of the nearest parent that has name servers, and shares that zone's
+// DNSSEC. failed is a parent lookup that failed before the answer was known.
+func (a *analyzer) signed() (on bool, at string, failed *RecordReport) {
+	if ds := a.rep.record("ds"); len(ds.Values) > 0 {
+		return true, a.rep.Domain, nil
+	}
+	if !a.subdomain {
+		return false, "", nil
+	}
+	for _, p := range parentNames(a.rep.Domain) {
+		ns := a.rep.record("parent-ns:" + p)
+		if !ns.Answered {
+			return false, "", ns
+		}
+		if len(ns.Values) == 0 {
+			continue // not a zone of its own; look further up
+		}
+		ds := a.rep.record("parent-ds:" + p)
+		if !ds.Answered {
+			return false, "", ds
+		}
+		return len(ds.Values) > 0, p, nil
+	}
+	return false, "", nil
 }
 
 func (a *analyzer) website() {
@@ -425,11 +615,17 @@ func (a *analyzer) website() {
 			a.add(SevNote, areaWebsite, "ipv6_missing", fmt.Sprintf("%s has no IPv6 address (AAAA record). That is common and fine for now.", d), "")
 		case len(v6.Values) > 0:
 			a.add(SevOK, areaWebsite, "apex_ok", fmt.Sprintf("%s points to %s (IPv6 only).", d, listShort(v6.Values, 2)), "")
+		case a.subdomain:
+			a.add(SevNote, areaWebsite, "apex_no_address",
+				fmt.Sprintf("%s does not point to any server. That is fine if it is not meant to be a website.", d), "")
 		default:
 			a.add(SevWarning, areaWebsite, "apex_no_address",
 				fmt.Sprintf("%s does not point to any server, so typing it into a browser without www will not load a website.", d),
 				fmt.Sprintf("Point %s itself at your website (an A record, or an ALIAS or flattened CNAME if your DNS provider offers one), or redirect it to www.", d))
 		}
+	}
+	if a.subdomain {
+		return // nobody types www in front of a subdomain
 	}
 	if a.unknown(www, areaWebsite) {
 		return
@@ -469,8 +665,11 @@ func (a *analyzer) nameServers() {
 	}
 	switch n := len(ns.Values); {
 	case n == 0:
-		a.add(SevNote, areaNS, "ns_none",
-			fmt.Sprintf("No name servers are listed for %s itself. That is normal for a subdomain, which uses its parent domain's name servers.", a.rep.Domain), "")
+		msg := fmt.Sprintf("No name servers are listed for %s itself. That is normal for a subdomain, which uses its parent domain's name servers.", a.rep.Domain)
+		if a.subdomain {
+			msg += " Where it has no record of its own, this check uses the parent domain's DMARC policy, CAA records and DNSSEC."
+		}
+		a.add(SevNote, areaNS, "ns_none", msg, "")
 	case n == 1:
 		a.add(SevWarning, areaNS, "ns_single",
 			fmt.Sprintf("Only one name server: %s%s. If it goes down, the whole domain stops working.", ns.Values[0], hint),
@@ -555,12 +754,21 @@ func (a *analyzer) spf(exp *spfExpansion, hasMail bool) spfState {
 		sum.Lookups, sum.LookupsComplete, sum.MissingIncludes = exp.Lookups, exp.Complete, exp.Missing
 	}
 	a.rep.SPF = sum
+	// Receivers give SPF a permanent error, which counts as a failed check,
+	// when the record has terms they do not understand, needs more than 10
+	// lookups, or includes a domain with no SPF record or with more than one
+	// (RFC 7208 sections 4.5, 4.6, 4.6.4 and 5.2). A faker's server matches
+	// none of the earlier terms, so its check runs into that error too.
+	broken := len(rec.Unknown) > 0 || sum.Lookups > 10 ||
+		(exp != nil && (len(exp.Missing) > 0 || len(exp.Multiple) > 0))
 	state := spfHard
+	if broken {
+		state = spfBroken
+	}
 	if len(rec.Unknown) > 0 {
 		a.add(SevWarning, areaMailSec, "spf_syntax",
 			fmt.Sprintf("The SPF record has something receivers do not understand (%s), so they may treat SPF as broken.", short(strings.Join(rec.Unknown, " "), 60)),
 			"Fix or remove the parts of the SPF record that are not valid SPF terms.")
-		state = spfBroken
 	}
 	lookups := fmt.Sprintf("%d", sum.Lookups)
 	if !sum.LookupsComplete {
@@ -571,6 +779,8 @@ func (a *analyzer) spf(exp *spfExpansion, hasMail bool) spfState {
 		uses = fmt.Sprintf(" It uses %s of the 10 allowed DNS lookups.", lookups)
 	}
 	shown := short(rec.Raw, 120)
+	// When SPF is broken, the -all, ~all and redirect findings would be
+	// misleading good news, so they are left out.
 	switch rec.All {
 	case "+":
 		a.add(SevProblem, areaMailSec, "spf_plus_all",
@@ -581,49 +791,57 @@ func (a *analyzer) spf(exp *spfExpansion, hasMail bool) spfState {
 		a.add(SevWarning, areaMailSec, "spf_neutral_all",
 			fmt.Sprintf("The SPF record ends in ?all (neutral), which tells receivers nothing about email from other servers: %s", shown),
 			"Change ?all at the end of the SPF record to -all (or ~all while you confirm every service that sends your email is listed).")
-		if state != spfBroken {
+		if !broken {
 			state = spfNeutral
 		}
 	case "~":
-		a.add(SevNote, areaMailSec, "spf_softfail",
-			fmt.Sprintf("SPF is set up and ends in ~all (soft fail), so email from servers not on the list is marked as suspicious but not rejected. That works well with an enforcing DMARC policy; -all is the strictest setting.%s Record: %s", uses, shown),
-			"Optional: once you are sure every service that sends your email is listed, change ~all to -all.")
-		if state != spfBroken {
+		if !broken {
+			a.add(SevNote, areaMailSec, "spf_softfail",
+				fmt.Sprintf("SPF is set up and ends in ~all (soft fail), so email from servers not on the list is marked as suspicious but not rejected. That works well with an enforcing DMARC policy; -all is the strictest setting.%s Record: %s", uses, shown),
+				"Optional: once you are sure every service that sends your email is listed, change ~all to -all.")
 			state = spfSoft
 		}
 	case "-":
-		a.add(SevOK, areaMailSec, "spf_ok",
-			fmt.Sprintf("SPF is set up and ends in -all, so email from servers not on the list should be rejected.%s Record: %s", uses, shown), "")
+		if !broken {
+			a.add(SevOK, areaMailSec, "spf_ok",
+				fmt.Sprintf("SPF is set up and ends in -all, so email from servers not on the list should be rejected.%s Record: %s", uses, shown), "")
+		}
 	default:
 		if rec.Redirect != "" {
-			a.add(SevOK, areaMailSec, "spf_redirect",
-				fmt.Sprintf("SPF is set up and hands over to the record at %s (redirect).%s Record: %s", rec.Redirect, uses, shown), "")
-			if state != spfBroken {
+			if !broken {
+				a.add(SevOK, areaMailSec, "spf_redirect",
+					fmt.Sprintf("SPF is set up and hands over to the record at %s (redirect).%s Record: %s", rec.Redirect, uses, shown), "")
 				state = spfRedirect
 			}
 		} else {
 			a.add(SevWarning, areaMailSec, "spf_no_all",
 				fmt.Sprintf("The SPF record does not end with an all rule, so email from other servers gets a neutral result: %s", shown),
 				"Add -all (or ~all while you test) to the end of the SPF record.")
-			if state != spfBroken {
+			if !broken {
 				state = spfNeutral
 			}
 		}
 	}
+	if len(rec.AfterAll) > 0 {
+		after := short(strings.Join(rec.AfterAll, " "), 80)
+		a.add(SevWarning, areaMailSec, "spf_after_all",
+			fmt.Sprintf("The SPF record has %s after its all rule (%s). Receivers stop reading at the all rule, so anything after it is ignored and the servers listed there are not approved. Record: %s", after, rec.AllTerm, shown),
+			fmt.Sprintf("Move %s in front of %s, so the all rule is the last part of the SPF record. This often happens when a new email service is added at the end of the record.", after, rec.AllTerm))
+	}
 	if sum.Lookups > 10 {
 		a.add(SevProblem, areaMailSec, "spf_too_many_lookups",
-			fmt.Sprintf("The SPF record needs %s DNS lookups, counting the records it includes. The limit is 10, so receivers may stop checking and treat SPF as broken.", lookups),
+			fmt.Sprintf("The SPF record needs %s DNS lookups, counting the records it includes. The limit is 10, so receivers treat SPF as broken. Record: %s", lookups, shown),
 			"Remove services you no longer use from the SPF record, or replace include: entries with the ip4: and ip6: addresses they cover, so the record needs 10 lookups or fewer.")
 	}
 	if exp != nil {
 		for _, m := range exp.Missing {
-			a.add(SevWarning, areaMailSec, "spf_include_missing",
-				fmt.Sprintf("The SPF record includes %s, but %s has no SPF record. Receivers treat that as an error.", m, m),
+			a.add(SevProblem, areaMailSec, "spf_include_missing",
+				fmt.Sprintf("The SPF record includes %s, but %s has no SPF record. Receivers treat that as an error, so SPF is broken. Record: %s", m, m, shown),
 				fmt.Sprintf("Remove include:%s from the SPF record, or replace it with the include your provider currently documents.", m))
 		}
 		for _, m := range exp.Multiple {
-			a.add(SevWarning, areaMailSec, "spf_include_missing",
-				fmt.Sprintf("The SPF record includes %s, which has more than one SPF record. Receivers treat that as an error.", m),
+			a.add(SevProblem, areaMailSec, "spf_include_missing",
+				fmt.Sprintf("The SPF record includes %s, which has more than one SPF record. Receivers treat that as an error, so SPF is broken. Record: %s", m, shown),
 				fmt.Sprintf("Ask the owner of %s to fix their SPF record, or replace the include with their sending addresses.", m))
 		}
 	}
@@ -634,61 +852,97 @@ func (a *analyzer) spf(exp *spfExpansion, hasMail bool) spfState {
 	return state
 }
 
+func dmarcRecords(values []string) []string {
+	var out []string
+	for _, v := range values {
+		if isDMARC(v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// dmarc reports on the DMARC policy. When the domain has no DMARC record of
+// its own, the nearest parent domain's record applies, using its subdomain
+// policy (sp=) when it has one and its main policy (p=) otherwise (RFC 7489
+// section 6.6.3).
 func (a *analyzer) dmarc() dmarcState {
 	d := a.rep.Domain
 	r := a.rep.record("dmarc")
 	if a.unknown(r, areaMailSec) {
 		return dmarcState{}
 	}
-	var records []string
-	for _, v := range r.Values {
-		if isDMARC(v) {
-			records = append(records, v)
+	records := dmarcRecords(r.Values)
+	src, inherited := r, false
+	parents := a.parents("parent-dmarc:")
+	if len(records) == 0 {
+		for _, p := range parents {
+			if a.unknown(p, areaMailSec) {
+				return dmarcState{}
+			}
+			if recs := dmarcRecords(p.Values); len(recs) > 0 {
+				records, src, inherited = recs, p, true
+				break
+			}
 		}
 	}
 	switch len(records) {
 	case 0:
-		a.add(SevProblem, areaMailSec, "dmarc_missing",
-			"No DMARC policy. DMARC tells receiving mail servers what to do with email that fails the SPF and DKIM checks, and sends you reports. Without it, each receiver decides for itself and fakes often get through.",
+		msg := "No DMARC policy. DMARC tells receiving mail servers what to do with email that fails the SPF and DKIM checks, and sends you reports. Without it, each receiver decides for itself and fakes often get through."
+		if len(parents) > 0 {
+			msg += fmt.Sprintf(" Neither %s nor %s has one.", d, joinAnd(parentNames(d)))
+		}
+		a.add(SevProblem, areaMailSec, "dmarc_missing", msg,
 			fmt.Sprintf("Add a TXT record at _dmarc.%s. A safe start is \"v=DMARC1; p=none; rua=mailto:you@%s\" (use a mailbox you read) to collect reports, then move to p=quarantine and then p=reject once the reports show only your real senders.", d, d))
 		return dmarcState{known: true}
 	case 1:
 	default:
 		a.add(SevProblem, areaMailSec, "dmarc_multiple",
-			fmt.Sprintf("There are %d DMARC records at _dmarc.%s. Receivers ignore DMARC when there is more than one.", len(records), d),
-			fmt.Sprintf("Keep one DMARC record at _dmarc.%s and delete the others.", d))
+			fmt.Sprintf("There are %d DMARC records at %s. Receivers ignore DMARC when there is more than one.", len(records), src.Name),
+			fmt.Sprintf("Keep one DMARC record at %s and delete the others.", src.Name))
 		return dmarcState{known: true, present: true}
 	}
 	rec := parseDMARC(records[0])
-	a.rep.DMARC = &DMARCSummary{Record: rec.Raw, Policy: rec.Policy, SubdomainPolicy: rec.SubPolicy, Pct: rec.Pct, Reports: rec.RUA}
+	policy, tag := rec.Policy, "p"
+	if inherited && rec.Policy != "" && rec.SubPolicy != "" {
+		policy, tag = rec.SubPolicy, "sp"
+	}
+	a.rep.DMARC = &DMARCSummary{Record: rec.Raw, FoundAt: src.Name, Policy: rec.Policy, SubdomainPolicy: rec.SubPolicy,
+		AppliedPolicy: policy, Pct: rec.Pct, Reports: rec.RUA}
 	if a.rep.DMARC.Reports == nil {
 		a.rep.DMARC.Reports = []string{}
 	}
-	st := dmarcState{known: true, present: true, policy: rec.Policy, pct: rec.Pct}
-	switch rec.Policy {
+	st := dmarcState{known: true, present: true, policy: policy, tag: tag, pct: rec.Pct}
+	lead := fmt.Sprintf("DMARC is set to %s=%s", tag, policy)
+	where := "the DMARC record"
+	if inherited {
+		lead = fmt.Sprintf("%s has no DMARC record of its own, so the one at %s applies. It sets %s=%s", d, src.Name, tag, policy)
+		where = "the DMARC record at " + src.Name
+	}
+	switch policy {
 	case "":
 		a.add(SevProblem, areaMailSec, "dmarc_invalid",
-			fmt.Sprintf("The DMARC record has no valid policy (p=none, p=quarantine or p=reject), so receivers ignore it: %s", short(rec.Raw, 120)),
-			fmt.Sprintf("Fix the DMARC record at _dmarc.%s so it has a policy, for example \"v=DMARC1; p=none; rua=mailto:you@%s\".", d, d))
+			fmt.Sprintf("The DMARC record at %s has no valid policy (p=none, p=quarantine or p=reject), so receivers ignore it: %s", src.Name, short(rec.Raw, 120)),
+			fmt.Sprintf("Fix the DMARC record at %s so it has a policy, for example \"v=DMARC1; p=none; rua=mailto:you@%s\".", src.Name, d))
 	case "none":
-		fix := "Once the DMARC reports show that all your real email passes, change p=none to p=quarantine, then to p=reject."
+		fix := fmt.Sprintf("Once the DMARC reports show that all your real email passes, change %s=none to %s=quarantine, then to %s=reject.", tag, tag, tag)
 		if len(rec.RUA) == 0 {
-			fix = "Add rua=mailto:<a mailbox you read> to the DMARC record so you get reports, then, once they show all your real email passes, change p=none to p=quarantine and then p=reject."
+			fix = fmt.Sprintf("Add rua=mailto:<a mailbox you read> to %s so you get reports, then, once they show all your real email passes, change %s=none to %s=quarantine and then %s=reject.", where, tag, tag, tag)
 		}
 		a.add(SevWarning, areaMailSec, "dmarc_none",
-			"DMARC is set to p=none, which is monitoring only. Receivers may report fakes to you, but they are still told to deliver them.", fix)
+			lead+", which is monitoring only. Receivers may report fakes to you, but they are still told to deliver them.", fix)
 	case "quarantine":
-		a.add(SevOK, areaMailSec, "dmarc_quarantine", "DMARC is set to p=quarantine, so email that fails the checks should go to spam.", "")
+		a.add(SevOK, areaMailSec, "dmarc_quarantine", lead+", so email that fails the checks should go to spam.", "")
 	case "reject":
-		a.add(SevOK, areaMailSec, "dmarc_reject", "DMARC is set to p=reject, so email that fails the checks should be refused.", "")
+		a.add(SevOK, areaMailSec, "dmarc_reject", lead+", so email that fails the checks should be refused.", "")
 	}
-	enforcing := rec.Policy == "quarantine" || rec.Policy == "reject"
+	enforcing := policy == "quarantine" || policy == "reject"
 	if enforcing && rec.Pct < 100 {
 		a.add(SevWarning, areaMailSec, "dmarc_pct",
 			fmt.Sprintf("DMARC applies its policy to only %d%% of failing email (pct=%d). The rest is treated as if the policy were p=none.", rec.Pct, rec.Pct),
 			"Remove pct= from the DMARC record (or set it to 100) so the policy covers all email.")
 	}
-	if enforcing && rec.SubPolicy == "none" {
+	if enforcing && !inherited && rec.SubPolicy == "none" {
 		a.add(SevWarning, areaMailSec, "dmarc_sp_none",
 			fmt.Sprintf("DMARC protects %s but not its subdomains (sp=none), so fakes from made-up addresses like billing.%s are still delivered.", d, d),
 			"Remove sp=none from the DMARC record (or set it to quarantine or reject) so made-up subdomains are blocked too.")
@@ -781,39 +1035,28 @@ func (a *analyzer) mailExtras(hasMail bool, dmarc dmarcState) {
 	}
 }
 
-func (a *analyzer) domainSecurity() {
+func (a *analyzer) domainSecurity(dnssecBroken bool) {
+	a.caa()
 	d := a.rep.Domain
-	caa := a.rep.record("caa")
-	if !a.unknown(caa, areaDomainSec) {
-		var issuers []string
-		for _, v := range caa.Values {
-			// Values look like: 0 issue "letsencrypt.org"
-			parts := strings.SplitN(v, " ", 3)
-			if len(parts) == 3 && (parts[1] == "issue" || parts[1] == "issuewild") {
-				name, _, _ := strings.Cut(strings.Trim(parts[2], `"`), ";")
-				if name = strings.TrimSpace(name); name != "" && !slices.Contains(issuers, name) {
-					issuers = append(issuers, name)
-				}
-			}
-		}
-		switch {
-		case len(issuers) > 0:
-			a.add(SevOK, areaDomainSec, "caa_ok", fmt.Sprintf("CAA limits who may issue certificates for %s to: %s.", d, strings.Join(issuers, ", ")), "")
-		case len(caa.Values) > 0:
-			a.add(SevOK, areaDomainSec, "caa_ok", fmt.Sprintf("CAA records are published for %s.", d), "")
-		default:
-			a.add(SevNote, areaDomainSec, "caa_missing",
-				fmt.Sprintf("No CAA record, so any certificate authority may issue a certificate for %s.", d),
-				"Optional: add a CAA record naming the certificate authority you use, for example 0 issue \"letsencrypt.org\" if your certificates come from Let's Encrypt.")
-		}
-	}
 	ds := a.rep.record("ds")
 	if a.unknown(ds, areaDomainSec) {
 		return
 	}
-	if len(ds.Values) > 0 {
+	on, at, failed := a.signed()
+	if failed != nil {
+		a.unknown(failed, areaDomainSec)
+		return
+	}
+	if on {
 		a.rep.DNSSEC = true
-		a.add(SevOK, areaDomainSec, "dnssec_on", "DNSSEC is on (a DS record is published at the registry), so resolvers can detect forged DNS answers for this domain.", "")
+		if dnssecBroken {
+			return // zoneHealth already reported it
+		}
+		msg := "DNSSEC is on (a DS record is published at the registry), so resolvers can detect forged DNS answers for this domain."
+		if at != d {
+			msg = fmt.Sprintf("DNSSEC is on for %s, which %s is part of, so resolvers can detect forged DNS answers for it.", at, d)
+		}
+		a.add(SevOK, areaDomainSec, "dnssec_on", msg, "")
 		return
 	}
 	a.add(SevNote, areaDomainSec, "dnssec_off",
@@ -821,20 +1064,86 @@ func (a *analyzer) domainSecurity() {
 		"Optional: turn on DNSSEC in your DNS provider's settings, then add the DS record it gives you at your domain registrar.")
 }
 
+// caa reports on CAA records. Certificate authorities use the nearest CAA
+// records going up the name, so a domain without its own uses its parent's
+// (RFC 8659 section 3).
+func (a *analyzer) caa() {
+	d := a.rep.Domain
+	caa := a.rep.record("caa")
+	if a.unknown(caa, areaDomainSec) {
+		return
+	}
+	values, at := caa.Values, d
+	if len(values) == 0 {
+		for _, p := range a.parents("parent-caa:") {
+			if a.unknown(p, areaDomainSec) {
+				return
+			}
+			if len(p.Values) > 0 {
+				values, at = p.Values, p.Name
+				break
+			}
+		}
+	}
+	var issuers []string
+	for _, v := range values {
+		// Values look like: 0 issue "letsencrypt.org"
+		parts := strings.SplitN(v, " ", 3)
+		if len(parts) == 3 && (parts[1] == "issue" || parts[1] == "issuewild") {
+			name, _, _ := strings.Cut(strings.Trim(parts[2], `"`), ";")
+			if name = strings.TrimSpace(name); name != "" && !slices.Contains(issuers, name) {
+				issuers = append(issuers, name)
+			}
+		}
+	}
+	switch {
+	case len(issuers) > 0 && at == d:
+		a.add(SevOK, areaDomainSec, "caa_ok", fmt.Sprintf("CAA limits who may issue certificates for %s to: %s.", d, strings.Join(issuers, ", ")), "")
+	case len(issuers) > 0:
+		a.add(SevOK, areaDomainSec, "caa_ok", fmt.Sprintf("The CAA records of %s limit who may issue certificates for %s to: %s.", at, d, strings.Join(issuers, ", ")), "")
+	case len(values) > 0 && at == d:
+		a.add(SevOK, areaDomainSec, "caa_ok", fmt.Sprintf("CAA records are published for %s.", d), "")
+	case len(values) > 0:
+		a.add(SevOK, areaDomainSec, "caa_ok", fmt.Sprintf("The CAA records of %s also cover %s.", at, d), "")
+	default:
+		a.add(SevNote, areaDomainSec, "caa_missing",
+			fmt.Sprintf("No CAA record, so any certificate authority may issue a certificate for %s.", d),
+			"Optional: add a CAA record naming the certificate authority you use, for example 0 issue \"letsencrypt.org\" if your certificates come from Let's Encrypt.")
+	}
+}
+
 // addressIDs are records where different answers can be normal (CDNs hand out
 // different addresses in different places).
 var addressIDs = map[string]bool{"a": true, "aaaa": true, "www": true}
 
-func (a *analyzer) disagreements() {
-	usable := 0
-	for _, st := range a.rep.Resolvers {
-		if st.Usable {
-			usable++
+// withoutSerial drops the serial number and timers from SOA answers. Many
+// providers change the serial on every edit or re-signing, and resolvers
+// cache it for different lengths of time, so a serial difference alone means
+// nothing to the domain owner.
+func withoutSerial(per []ResolverAnswer) []ResolverAnswer {
+	out := slices.Clone(per)
+	for i := range out {
+		vals := make([]string, len(out[i].Values))
+		for j, v := range out[i].Values {
+			f := strings.Fields(v)
+			if len(f) > 2 {
+				f = f[:2]
+			}
+			vals[j] = strings.Join(f, " ")
 		}
+		out[i].Values = vals
 	}
+	return out
+}
+
+func (a *analyzer) disagreements() {
 	disagree := false
 	for _, r := range a.rep.Records {
-		groups := answerGroups(r.PerResolver)
+		per := r.PerResolver
+		if r.ID == "soa" {
+			per = withoutSerial(per)
+		}
+		groups := answerGroups(per)
 		if len(groups) < 2 {
 			continue
 		}
@@ -853,10 +1162,36 @@ func (a *analyzer) disagreements() {
 	if disagree {
 		return
 	}
-	if usable > 1 {
-		a.add(SevOK, areaResolvers, "resolvers_agree", fmt.Sprintf("All %d resolvers that answered gave the same answers.", usable), "")
-	} else {
-		a.add(SevNote, areaResolvers, "single_resolver", "Only one resolver answered, so answers could not be compared.", "")
+	// Only resolvers that answered most lookups count as compared: one that
+	// answered a single lookup proves little by agreeing.
+	compared := 0
+	for ri := range a.rep.Resolvers {
+		answered := 0
+		for _, r := range a.rep.Records {
+			if ri < len(r.PerResolver) && r.PerResolver[ri].Error == "" {
+				answered++
+			}
+		}
+		if len(a.rep.Records) > 0 && answered*2 > len(a.rep.Records) {
+			compared++
+		}
+	}
+	all := compared == len(a.rep.Resolvers)
+	switch {
+	case compared == 2 && all:
+		a.add(SevOK, areaResolvers, "resolvers_agree", "Both resolvers gave the same answers.", "")
+	case compared == 2:
+		a.add(SevOK, areaResolvers, "resolvers_agree", "Both resolvers that answered gave the same answers.", "")
+	case compared > 2 && all:
+		a.add(SevOK, areaResolvers, "resolvers_agree", fmt.Sprintf("All %d resolvers gave the same answers.", compared), "")
+	case compared > 2:
+		a.add(SevOK, areaResolvers, "resolvers_agree", fmt.Sprintf("All %d resolvers that answered gave the same answers.", compared), "")
+	case len(a.rep.Resolvers) == 1:
+		a.add(SevNote, areaResolvers, "single_resolver", "Only one resolver was asked, so answers could not be compared.", "")
+	case compared == 1:
+		a.add(SevNote, areaResolvers, "single_resolver", "Only one resolver answered most of the lookups, so answers could not be compared.", "")
+	default:
+		a.add(SevNote, areaResolvers, "single_resolver", "No resolver answered most of the lookups, so answers could not be compared.", "")
 	}
 }
 
@@ -879,7 +1214,10 @@ func describeGroups(groups []answerGroup) string {
 }
 
 // spoofVerdict answers whether someone could send email that looks like it
-// comes from the domain.
+// comes from the domain, meaning the From line people see. Only an enforcing
+// DMARC policy tells receivers to check that line: SPF on its own checks the
+// hidden sender address (the envelope), which a faker can set to any domain
+// they control.
 func spoofVerdict(domain string, s spfState, d dmarcState) Verdict {
 	if s == spfUnknown || !d.known {
 		return Verdict{Answer: "Not sure", Reason: "some lookups failed, so SPF and DMARC could not be fully checked. Run the check again."}
@@ -895,16 +1233,20 @@ func spoofVerdict(domain string, s spfState, d dmarcState) Verdict {
 	case d.policy == "reject" || d.policy == "quarantine":
 		return Verdict{Answer: "Partly", Reason: fmt.Sprintf("DMARC applies its %s policy to only %d%% of failing email, so the rest is handled as if there were no policy.", d.policy, d.pct)}
 	}
+	tag := d.tag
+	if tag == "" {
+		tag = "p"
+	}
 	dm := "there is no DMARC policy"
 	switch {
 	case d.policy == "none":
-		dm = "DMARC is set to monitoring only (p=none)"
+		dm = "DMARC is set to monitoring only (" + tag + "=none)"
 	case d.present:
 		dm = "the DMARC record is not valid"
 	}
 	switch s {
 	case spfHard, spfSoft, spfRedirect:
-		return Verdict{Answer: "Partly", Reason: "SPF catches some fakes, but " + dm + ", so nothing stops a fake that shows " + domain + " in the From line people see."}
+		return Verdict{Answer: "Yes", Reason: dm + ", so nothing tells receiving mail servers to block a fake that shows " + domain + " in the From line people see. SPF is set up, but on its own it only stops fakes that also forge the hidden sender address, which a faker does not need to do."}
 	}
 	sp := "there is no SPF record"
 	switch s {

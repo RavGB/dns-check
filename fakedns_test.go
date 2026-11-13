@@ -18,6 +18,10 @@ type zone struct {
 	records  map[string][]dnsmessage.ResourceBody // key: name + "|" + type
 	names    map[string]bool                      // names that exist (others get NXDOMAIN)
 	truncate map[string]bool                      // names whose UDP answers are cut off
+	// servfail, when set, picks questions that get a SERVFAIL answer, the way
+	// a validating resolver answers for a zone whose DNSSEC is broken.
+	servfail func(name string, t dnsmessage.Type) bool
+	noTCP    bool // close TCP connections without answering
 }
 
 func newZone() *zone {
@@ -197,6 +201,9 @@ func startFakeDNS(t *testing.T, z *zone) *fakeDNS {
 
 func (s *fakeDNS) serveTCP(conn net.Conn) {
 	defer conn.Close()
+	if s.zone.noTCP {
+		return
+	}
 	for {
 		var lenBuf [2]byte
 		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
@@ -233,9 +240,12 @@ func (s *fakeDNS) handle(msg []byte, udp bool) []byte {
 		Questions: []dnsmessage.Question{q},
 	}
 	name := strings.ToLower(strings.TrimSuffix(q.Name.String(), "."))
-	if udp && s.zone.truncate[name] {
+	switch {
+	case s.zone.servfail != nil && s.zone.servfail(name, q.Type):
+		resp.Header.RCode = dnsmessage.RCodeServerFailure
+	case udp && s.zone.truncate[name]:
 		resp.Header.Truncated = true
-	} else {
+	default:
 		resp.Header.RCode, resp.Answers = s.zone.answer(q)
 	}
 	out, err := resp.Pack()
